@@ -109,6 +109,16 @@ const REMEMBER = 50_000;
 /** Bot API parameters that take a file, and the field of an InputMedia that does. */
 const FILE_FIELDS = new Set(["photo", "audio", "document", "video", "animation", "voice", "video_note", "sticker", "thumbnail", "cover", "media", "certificate"]);
 
+/** Unset keeps the public default. An explicitly empty or mistyped restriction must never open the bot to everyone. */
+function allowedUserIds(value: string | undefined): ReadonlySet<number> | undefined {
+  if (value === undefined) return undefined;
+  const ids = value.split(",").map((id) => id.trim());
+  if (ids.some((id) => !/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id)))) {
+    throw new Error("TELEGRAM_ALLOWED_USER_IDS must be a nonempty comma-separated list of positive integer Telegram user IDs");
+  }
+  return new Set(ids.map(Number));
+}
+
 /** apiUrl: Telegram's Bot API server. Only tests give another one, a fake server. */
 export function createChannel(config: ChannelConfig, _env: ChannelEnv, apiUrl = "https://api.telegram.org"): ChannelAdapter {
   if (typeof config.secrets !== "string") throw new Error(`channel ${config.id}: "secrets" must name the env file with TELEGRAM_BOT_TOKEN`);
@@ -120,6 +130,7 @@ class TelegramChannel implements ChannelAdapter {
   readonly #secrets: string;
   readonly #apiUrl: string;
   #token?: string;
+  #allowedUserIds?: ReadonlySet<number>;
   #bot?: TgBot;
   #sdk?: GatewayTelegramAdapter;
   #stopping?: AbortController;
@@ -145,7 +156,10 @@ class TelegramChannel implements ChannelAdapter {
   }
 
   async start(sink: ChannelSink): Promise<void> {
-    this.#token = readSecrets(this.#secrets, ["TELEGRAM_BOT_TOKEN"]).TELEGRAM_BOT_TOKEN!;
+    const secrets = readSecrets(this.#secrets, ["TELEGRAM_BOT_TOKEN"], ["TELEGRAM_ALLOWED_USER_IDS"]);
+    // A channel's file wins over the process-wide default. Reading it never changes process.env.
+    this.#allowedUserIds = allowedUserIds(secrets.TELEGRAM_ALLOWED_USER_IDS ?? process.env.TELEGRAM_ALLOWED_USER_IDS);
+    this.#token = secrets.TELEGRAM_BOT_TOKEN!;
     const bot = await this.#api<TgBot>("getMe").catch((error: unknown) => {
       // Telegram answers a token it does not know with 401 or 404.
       if (error instanceof TelegramError && (error.code === 401 || error.code === 404)) {
@@ -173,7 +187,8 @@ class TelegramChannel implements ChannelAdapter {
   /**
    * Long polling. Each update is stored before the next getUpdates asks for the ones after it: Telegram takes an update
    * as confirmed only when getUpdates asks from a higher offset, and keeps one that is not confirmed for up to 24 hours.
-   * So an update that was not stored, because of a crash or a failed store, comes again.
+   * So an update that was not stored, because of a crash or a failed store, comes again. Unauthorized updates are
+   * deliberately discarded before storage, but advance the offset too, so they cannot pin the poller.
    */
   async #poll(sink: ChannelSink, signal: AbortSignal): Promise<void> {
     let offset: number | undefined;
@@ -198,8 +213,10 @@ class TelegramChannel implements ChannelAdapter {
       }
       try {
         for (const update of updates) {
-          await sink.receive(`update:${update.update_id}`, update);
-          if (update.callback_query) this.#answerCallback(sink, update.callback_query.id);
+          if (this.#allows(update)) {
+            await sink.receive(`update:${update.update_id}`, update);
+            if (update.callback_query) this.#answerCallback(sink, update.callback_query.id);
+          }
           offset = update.update_id + 1;
         }
         failures = 0;
@@ -208,6 +225,20 @@ class TelegramChannel implements ChannelAdapter {
         await pause("update not stored; Telegram gives it again with the next poll", error);
       }
     }
+  }
+
+  /** Authorize the actor, never the chat, a quoted author, or the bot whose button was pressed. */
+  #allows(update: Update): boolean {
+    if (!this.#allowedUserIds) return true;
+    const messages = [update.message, update.edited_message, update.channel_post, update.edited_channel_post];
+    const payloads = [...messages, update.callback_query, update.message_reaction, update.my_chat_member];
+    // Telegram sends one payload per update. Unknown or ambiguous updates cannot establish a trusted actor.
+    if (payloads.filter(Boolean).length !== 1) return false;
+    const message = messages.find((m) => m !== undefined);
+    // sender_chat is a channel or an anonymous administrator, not the legacy placeholder in message.from.
+    if (message?.sender_chat || update.message_reaction?.actor_chat) return false;
+    const user = message?.from ?? update.callback_query?.from ?? update.message_reaction?.user ?? update.my_chat_member?.from;
+    return user !== undefined && Number.isSafeInteger(user.id) && this.#allowedUserIds.has(user.id);
   }
 
   /**

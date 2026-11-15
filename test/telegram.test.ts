@@ -14,6 +14,7 @@ let telegram: Awaited<ReturnType<typeof fakeTelegram>>;
 let channel: ChannelAdapter;
 
 beforeEach(async () => {
+  vi.stubEnv("TELEGRAM_ALLOWED_USER_IDS", undefined);
   dir = mkdtempSync(join(tmpdir(), "pots-telegram-"));
   writeFileSync(join(dir, "telegram.env"), `TELEGRAM_BOT_TOKEN=${TOKEN}\n`);
   telegram = await fakeTelegram();
@@ -24,6 +25,7 @@ afterEach(async () => {
   await channel.stop();
   await telegram.close();
   rmSync(dir, { recursive: true, force: true });
+  vi.unstubAllEnvs();
 });
 
 function sink(receive: ChannelSink["receive"] = async () => {}, logs: string[] = []): ChannelSink {
